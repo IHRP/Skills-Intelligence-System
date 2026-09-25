@@ -1,9 +1,8 @@
-# .github/workflows/refresh_courses.yml
 name: Refresh SWDA courses
 
 on:
   schedule:
-    - cron: '0 18 1 * *'      # 02:00 SGT on the 1st
+    - cron: '0 18 1 * *'          # 02:00 SGT on the 1st of each month
   workflow_dispatch:
     inputs:
       keyword:
@@ -11,16 +10,20 @@ on:
         default: 'HR'
       pages:
         description: 'Pages to scrape (0 = all)'
-        default: '0'
+        default: '1'
+      skip_load:
+        description: 'Scrape only, do not write to Supabase'
+        type: boolean
+        default: false
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120        # detail scraping is slow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
@@ -34,19 +37,24 @@ jobs:
         run: |
           python scripts/scrape_swda.py \
             --keyword "${{ inputs.keyword || 'HR' }}" \
-            --pages ${{ inputs.pages || 0 }} \
+            --pages ${{ inputs.pages || 1 }} \
             --out data
 
       - name: Load into Supabase
+        if: ${{ inputs.skip_load != true }}
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/load_courses.py data/skillsfuture_hr.xlsx
 
-      - name: Keep the scraped file
+      - name: Upload output and debug files
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: swda-${{ github.run_number }}
-          path: data/*.xlsx
-          retention-days: 90
+          path: |
+            data/*.xlsx
+            data/debug_*.png
+            data/debug_*.html
+          retention-days: 14
+          if-no-files-found: warn
