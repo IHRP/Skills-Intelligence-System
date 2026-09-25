@@ -1,0 +1,36 @@
+# .github/workflows/refresh_courses.yml
+name: Refresh SWDA courses
+
+on:
+  schedule:
+    - cron: '0 18 1 * *'      # 02:00 SGT on the 1st (cron is UTC)
+  workflow_dispatch:          # manual "Run workflow" button
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Scrape SWDA
+        run: python scripts/scrape_swda.py
+
+      - name: Load into Supabase
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/load_courses.py
+
+      - name: Keep the scraped CSV for 90 days
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swda-csv-${{ github.run_number }}
+          path: data/swda_courses.csv
