@@ -66,7 +66,8 @@ def build_search_url(keyword: str, page: int, page_size: int = 10) -> str:
         f"&sort_by=relevance"
     )
 
-COURSE_LINK_RE = re.compile(r"^/course-directory/courses/[A-Za-z0-9\-]+$")
+# ── Config ────────────────────────────────────────────────────
+SITE_BASE = "https://skillsfuture.gobusiness.gov.sg"
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
@@ -74,6 +75,7 @@ CHROMIUM_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--no-first-run",
+    "--disable-blink-features=AutomationControlled",   # hides the automation flag
 ]
 
 USER_AGENT = (
@@ -81,6 +83,16 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+STEALTH_INIT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-SG','en']});
+Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+window.chrome = { runtime: {} };
+"""
+
+CONSENT_LABELS = ["Accept all", "Accept All", "Accept", "I agree",
+                  "Agree", "Continue", "OK", "Got it", "Close"]
 
 # ── Excel styling ─────────────────────────────────────────────
 _thin       = Side(style="thin", color="C0C0C0")
@@ -227,9 +239,46 @@ def parse_card_text(text: str, provider_hint: str, href: str) -> dict | None:
 # SCRAPING
 # ─────────────────────────────────────────────────────────────
 
+async def dismiss_overlays(page) -> None:
+    """Click through any cookie/consent banner that blocks the results."""
+    for label in CONSENT_LABELS:
+        try:
+            btn = page.get_by_role("button", name=label, exact=False).first
+            await btn.click(timeout=2000)
+            print(f"        (dismissed overlay: {label!r})")
+            await asyncio.sleep(0.8)
+            return
+        except Exception:
+            continue
+    # some banners are plain links/divs rather than buttons
+    for label in CONSENT_LABELS:
+        try:
+            await page.locator(f"text={label}").first.click(timeout=1200)
+            print(f"        (dismissed overlay via text: {label!r})")
+            await asyncio.sleep(0.8)
+            return
+        except Exception:
+            continue
+
+
+async def dump_debug(page, out_dir: str, tag: str) -> None:
+    """Save a screenshot + HTML so failures can be diagnosed from CI artifacts."""
+    try:
+        d = Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(d / f"debug_{tag}.png"), full_page=True)
+        (d / f"debug_{tag}.html").write_text(await page.content(), encoding="utf-8")
+        print(f"        (debug saved: debug_{tag}.png / .html)")
+    except Exception as e:
+        print(f"        (debug dump failed: {str(e)[:60]})")
+
 async def scrape_search_page(page) -> list[dict]:
     """Extract course cards from the current search results page."""
-    await page.wait_for_selector('a[href*="/course-directory/courses/"]', timeout=60_000)
+    try:
+        await page.wait_for_selector(
+            'a[href*="/course-directory/courses/"]', timeout=45_000)
+    except Exception:
+        return []                      # caller decides what to do
     await asyncio.sleep(1.5)
 
     raw_cards = await page.evaluate("""
@@ -242,38 +291,22 @@ async def scrape_search_page(page) -> list[dict]:
             for (const a of anchors) {
                 const href = a.getAttribute('href') || '';
                 if (!href) continue;
-
-                // Walk up to find the enclosing card: the smallest
-                // ancestor whose innerText also contains a fee line,
-                // which distinguishes the full card from the bare link.
                 let node = a;
                 let card = a;
                 for (let i = 0; i < 8 && node; i++) {
                     node = node.parentElement;
                     if (!node) break;
                     const t = node.innerText || '';
-                    if (/full course fee/i.test(t)) {
-                        card = node;
-                        break;
-                    }
+                    if (/full course fee/i.test(t)) { card = node; break; }
                 }
-
-                const key = href;
-                if (seen.has(key)) continue;
-                seen.add(key);
-
-                // Try to grab provider name and title separately if
-                // structured spans/elements are present (best effort;
-                // falls back to full-text regex parsing on Python side).
+                if (seen.has(href)) continue;
+                seen.add(href);
                 let providerHint = '';
                 const providerEl = card.querySelector('[class*="provider" i]');
                 if (providerEl) providerHint = providerEl.innerText.trim();
-
                 results.push({
-                    href,
-                    text: card.innerText || '',
-                    providerHint,
-                    anchorText: a.innerText || ''
+                    href, text: card.innerText || '',
+                    providerHint, anchorText: a.innerText || ''
                 });
             }
             return results;
@@ -283,17 +316,11 @@ async def scrape_search_page(page) -> list[dict]:
     rows = []
     for c in raw_cards:
         href = c["href"]
-        if href.startswith("/"):
-            full_url = SITE_BASE + href
-        else:
-            full_url = href
-
+        full_url = SITE_BASE + href if href.startswith("/") else href
         row = parse_card_text(c["text"], c.get("providerHint", ""), full_url)
-        if not row:
-            continue
-        rows.append(row)
+        if row:
+            rows.append(row)
     return rows
-
 
 async def scrape_course_details(page, course_url: str) -> tuple[str, str]:
     """
@@ -422,7 +449,8 @@ async def scrape_course_details(page, course_url: str) -> tuple[str, str]:
 
 
 
-async def run_scraper(keyword: str, max_pages: int, scrape_details: bool) -> list[dict]:
+async def run_scraper(keyword: str, max_pages: int, scrape_details: bool,
+out_dir: str = ".") -> list:
     from playwright.async_api import async_playwright
 
     all_courses: list[dict] = []
@@ -439,23 +467,51 @@ async def run_scraper(keyword: str, max_pages: int, scrape_details: bool) -> lis
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 900},
+            locale="en-SG",                       # match a Singapore visitor
+            timezone_id="Asia/Singapore",
+            extra_http_headers={
+                "Accept-Language": "en-SG,en;q=0.9",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
+        await context.add_init_script(STEALTH_INIT)
         page = await context.new_page()
 
-        # ── Phase 1: Collect all search-result cards, page by page ──
-        page_index = 0  # site's pagination is 0-indexed
+        # ── Phase 1: search result pages ──
+        page_index = 0
         page_num_display = 0
         for page_num_display in range(1, limit + 1):
             url = build_search_url(keyword, page_index, PAGE_SIZE)
             label = f"all ({page_num_display})" if scrape_all else f"{page_num_display}/{max_pages}"
             print(f"   📄 Scraping page {label}…", end=" ", flush=True)
 
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-                await asyncio.sleep(3)
+            page_courses = []
+            for attempt in (1, 2):                # one retry on an empty page
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=120_000)
+                except Exception as e:
+                    print(f"\n        goto failed: {str(e)[:70]}")
+                    await dump_debug(page, out_dir, f"p{page_index}_goto")
+                    break
+
+                await asyncio.sleep(2.0)
+                await dismiss_overlays(page)
+                # nudge lazy-loaded content
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1.2)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.6)
+
                 page_courses = await scrape_search_page(page)
-            except Exception as e:
-                print(f"FAILED ({str(e)[:60]})")
+                if page_courses:
+                    break
+                print(f"\n        attempt {attempt}: no cards found "
+                      f"(title={await page.title()!r})", end=" ")
+                await dump_debug(page, out_dir, f"p{page_index}_try{attempt}")
+                await asyncio.sleep(4.0)
+
+            if not page_courses:
+                print("  0 new — stopping")
                 break
 
             new = [c for c in page_courses if c["Course URL"] not in seen_keys]
@@ -463,26 +519,20 @@ async def run_scraper(keyword: str, max_pages: int, scrape_details: bool) -> lis
             all_courses.extend(new)
             print(f"  {len(new)} new  (total {len(all_courses)})")
 
-            # Stop once a page returns no cards at all (past the last page)
-            if not page_courses:
-                break
-            # Stop once a page returns fewer than a full page's worth
-            # (last page of results) -- but still counts what it found
             if len(page_courses) < PAGE_SIZE:
                 break
-
             page_index += 1
+            await asyncio.sleep(1.5)              # be polite between pages
 
         print(f"\n   ✅ {len(all_courses)} courses collected from {page_num_display} page(s).\n")
 
-        # ── Phase 2: Scrape detail pages (About + What you'll learn) ──
+        # ── Phase 2: detail pages ──
         if scrape_details and all_courses:
             print(f"   🔎 Fetching detail pages for {len(all_courses)} courses…\n")
             for i, course in enumerate(all_courses):
                 title = course["Course Title"]
-                url_c = course["Course URL"]
                 print(f"   [{i+1}/{len(all_courses)}] {title[:55]}…")
-                about, learn = await scrape_course_details(page, url_c)
+                about, learn = await scrape_course_details(page, course["Course URL"])
                 course["About this course"] = about
                 course["What you'll learn"] = learn
                 if about or learn:
@@ -586,6 +636,7 @@ def main():
             keyword=args.keyword,
             max_pages=args.pages,
             scrape_details=not args.no_details,
+            out_dir=args.out,
         )
     )
 
