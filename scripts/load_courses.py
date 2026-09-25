@@ -1,47 +1,72 @@
 # scripts/load_courses.py
-import os, csv, sys
+import os, re, sys
 from datetime import datetime, timezone
+import pandas as pd
 from supabase import create_client
 
-sb = create_client(os.environ["SUPABASE_URL"],
-                   os.environ["SUPABASE_SERVICE_KEY"])
-
+xlsx = sys.argv[1]
+sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 run_started = datetime.now(timezone.utc).isoformat()
 
-rows = list(csv.DictReader(open("data/swda_courses.csv", encoding="utf-8")))
-if len(rows) < 100:                       # sanity guard
-    sys.exit(f"Only {len(rows)} rows scraped - aborting, SWDA layout may have changed")
+# header is on row 2 (row 1 is the merged title banner)
+df = pd.read_excel(xlsx, header=1)
+df = df[df["Course Title"].notna()]
 
-# --- providers first (courses reference them) ---
-providers = sorted({r["training_provider"].strip() for r in rows if r["training_provider"]})
-sb.table("provider").upsert(
-    [{"provider_name": p} for p in providers],
-    on_conflict="provider_name").execute()
+if len(df) < 50:
+    sys.exit(f"Only {len(df)} rows - aborting, SWDA layout may have changed")
 
-pmap = {p["provider_name"]: p["provider_id"]
-        for p in sb.table("provider").select("provider_id, provider_name")
-                   .execute().data}
+def money(v):
+    if not isinstance(v, str) or not v.startswith("S$"):
+        return None
+    return float(v.replace("S$", "").replace(",", ""))
 
-# --- courses, in chunks ---
-payload = [{
-    "course_ref":           r["course_ref"],
-    "course_title":         r["course_title"],
-    "provider_id":          pmap[r["training_provider"].strip()],
-    "course_url":           r["course_url"],
-    "full_course_fee":      r["full_course_fee"] or None,
-    "star_rating":          r["star_rating"] or None,
-    "no_of_ratings":        r["no_of_ratings"] or None,
-    "upcoming_course_date": r["upcoming_course_date"] or None,
-    "about_this_course":    r["about_this_course"],
-    "last_seen_at":         run_started,
-    "is_active":            True,
-} for r in rows]
+def course_ref(url):
+    m = re.search(r"/courses/([A-Za-z0-9\-]+)", str(url))
+    return m.group(1) if m else None
+
+def when(v):
+    try:
+        return datetime.strptime(str(v).strip(), "%d %B %Y").date().isoformat()
+    except Exception:
+        return None            # covers "None listed"
+
+df["course_ref"] = df["Course URL"].map(course_ref)
+df = df[df["course_ref"].notna()].drop_duplicates("course_ref")
+
+# --- providers first ---
+provs = sorted({p.strip() for p in df["Training Provider"].dropna() if p.strip()})
+sb.table("provider").upsert([{"provider_name": p} for p in provs],
+                            on_conflict="provider_name").execute()
+pmap = {r["provider_name"]: r["provider_id"] for r in
+        sb.table("provider").select("provider_id, provider_name").execute().data}
+
+# --- courses ---
+payload = []
+for _, r in df.iterrows():
+    prov = str(r["Training Provider"]).strip()
+    payload.append({
+        "course_ref":           r["course_ref"],
+        "course_title":         str(r["Course Title"]).strip(),
+        "provider_id":          pmap.get(prov),
+        "course_url":           str(r["Course URL"]),
+        "full_course_fee":      money(r.get("Full Course Fee")),
+        "after_subsidy_fee":    money(r.get("After Subsidy Fee")),
+        "after_sfec_fee":       money(r.get("After SFEC Fee")),
+        "star_rating":          None if pd.isna(r.get("Star Rating")) else float(r["Star Rating"]),
+        "no_of_ratings":        int(r.get("No. of Ratings") or 0),
+        "upcoming_course_date": when(r.get("Upcoming Course Date")),
+        "about_this_course":    str(r.get("About this course") or "").strip(),
+        "what_youll_learn":     str(r.get("What you'll learn") or "").strip(),
+        "last_seen_at":         run_started,
+        "is_active":            True,
+    })
+
+payload = [p for p in payload if p["provider_id"] and p["about_this_course"]]
 
 for i in range(0, len(payload), 500):
     sb.table("course").upsert(payload[i:i+500], on_conflict="course_ref").execute()
 
-# --- retire anything SWDA no longer lists ---
 gone = sb.table("course").update({"is_active": False}) \
          .lt("last_seen_at", run_started).eq("is_active", True).execute()
 
-print(f"Upserted {len(payload)} courses · retired {len(gone.data)}")
+print(f"Upserted {len(payload)} · retired {len(gone.data)}")
