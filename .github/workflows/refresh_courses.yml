@@ -3,12 +3,20 @@ name: Refresh SWDA courses
 
 on:
   schedule:
-    - cron: '0 18 1 * *'      # 02:00 SGT on the 1st (cron is UTC)
-  workflow_dispatch:          # manual "Run workflow" button
+    - cron: '0 18 1 * *'      # 02:00 SGT on the 1st
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: 'Search keyword'
+        default: 'HR'
+      pages:
+        description: 'Pages to scrape (0 = all)'
+        default: '0'
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 120        # detail scraping is slow
     steps:
       - uses: actions/checkout@v4
 
@@ -19,18 +27,26 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Install Chromium
+        run: playwright install --with-deps chromium
+
       - name: Scrape SWDA
-        run: python scripts/scrape_swda.py
+        run: |
+          python scripts/scrape_swda.py \
+            --keyword "${{ inputs.keyword || 'HR' }}" \
+            --pages ${{ inputs.pages || 0 }} \
+            --out data
 
       - name: Load into Supabase
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scripts/load_courses.py
+        run: python scripts/load_courses.py data/skillsfuture_hr.xlsx
 
-      - name: Keep the scraped CSV for 90 days
+      - name: Keep the scraped file
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: swda-csv-${{ github.run_number }}
-          path: data/swda_courses.csv
+          name: swda-${{ github.run_number }}
+          path: data/*.xlsx
+          retention-days: 90
